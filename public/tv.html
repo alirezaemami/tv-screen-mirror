@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Mirror — TV</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    video { width: 100%; height: 100%; object-fit: contain; }
+    #status {
+      position: fixed; left: 0; right: 0; bottom: 40px; text-align: center;
+      color: #ddd; font: 32px sans-serif; text-shadow: 0 0 6px #000;
+    }
+  </style>
+</head>
+<body>
+  <!-- Video is always muted (so autoplay is allowed); sound goes through <audio>,
+       which TV browsers handle more reliably for WebRTC streams. -->
+  <video id="screen" autoplay muted playsinline></video>
+  <audio id="sound" autoplay></audio>
+  <div id="status">Waiting for sender…</div>
+
+<script>
+  // Plain ES5-style JS to stay friendly to older TV browsers.
+  var BUFFER_MS = 500; // extra playout buffer: more delay, but smoother + steady A/V sync
+
+  var video = document.getElementById('screen');
+  var sound = document.getElementById('sound');
+  var statusEl = document.getElementById('status');
+  var pc = null;
+  var statsTimer = null;
+  var soundBlocked = false;
+
+  function log(msg) { statusEl.textContent = msg; statusEl.style.display = msg ? '' : 'none'; console.log(msg); }
+
+  function signal(msg) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/signal?to=sender');
+    xhr.send(JSON.stringify(msg));
+  }
+
+  function waitForIce(pc) {
+    return new Promise(function (resolve) {
+      if (pc.iceGatheringState === 'complete') return resolve();
+      pc.onicegatheringstatechange = function () {
+        if (pc.iceGatheringState === 'complete') resolve();
+      };
+      setTimeout(resolve, 2000);
+    });
+  }
+
+  function setBuffer(receiver) {
+    try {
+      if ('jitterBufferTarget' in receiver) receiver.jitterBufferTarget = BUFFER_MS;
+      else receiver.playoutDelayHint = BUFFER_MS / 1000; // older Chrome
+    } catch (e) { console.warn('buffer hint not supported', e); }
+  }
+
+  // How sound is played — switch with the URL, e.g. /tv?audio=webaudio
+  //   element  : separate <audio> element (default)
+  //   webaudio : Web Audio API — no second media element (some TVs allow only one)
+  //   video    : the <video> element plays sound itself (single element)
+  //   off      : no sound (to check if video works without audio)
+  var AUDIO_MODE = (location.search.match(/audio=(\w+)/) || [])[1] || 'element';
+  var audioCtx = null;
+  var currentStream = null;
+
+  function soundOk() {
+    soundBlocked = false;
+    if (statusEl.textContent.indexOf('sound') !== -1) log('');
+  }
+  function soundFail() {
+    soundBlocked = true;
+    log('Press OK on the remote to turn on sound');
+  }
+  function tryPlay(el) {
+    var p = el.play();
+    if (p && p.then) p.then(soundOk).catch(soundFail);
+  }
+
+  function playSound() {
+    if (!currentStream || AUDIO_MODE === 'off') return;
+    if (AUDIO_MODE === 'element') {
+      if (sound.srcObject !== currentStream) sound.srcObject = currentStream;
+      sound.muted = false;
+      sound.volume = 1;
+      tryPlay(sound);
+    } else if (AUDIO_MODE === 'video') {
+      video.muted = false;
+      var p = video.play();
+      if (p && p.then) p.then(soundOk).catch(function () { video.muted = true; video.play(); soundFail(); });
+    } else if (AUDIO_MODE === 'webaudio') {
+      if (!audioCtx) {
+        var Ctx = window.AudioContext || window.webkitAudioContext;
+        audioCtx = new Ctx();
+        audioCtx.createMediaStreamSource(currentStream).connect(audioCtx.destination);
+      }
+      audioCtx.resume().then(function () {
+        if (audioCtx.state === 'running') soundOk(); else soundFail();
+      });
+    }
+  }
+
+  function resetAudio() {
+    sound.srcObject = null;
+    if (audioCtx) { audioCtx.close(); audioCtx = null; }
+    currentStream = null;
+  }
+
+  function audioState() {
+    if (AUDIO_MODE === 'element') return { paused: sound.paused, muted: sound.muted, hasStream: !!sound.srcObject };
+    if (AUDIO_MODE === 'video') return { paused: video.paused, muted: video.muted, hasStream: !!video.srcObject };
+    if (AUDIO_MODE === 'webaudio') return { paused: !audioCtx || audioCtx.state !== 'running', muted: false, hasStream: !!audioCtx };
+    return { paused: true, muted: true, hasStream: false };
+  }
+
+  function handleOffer(sdp) {
+    if (pc) pc.close();
+    resetAudio();
+    pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+
+    // Fires once per track. Both tracks share one stream, which keeps them lip-synced.
+    pc.ontrack = function (e) {
+      setBuffer(e.receiver);
+      var stream = e.streams[0];
+      if (e.track.kind === 'video') {
+        // The <video> always gets the full stream (muted), so the video pipeline
+        // runs the same way regardless of audio mode.
+        if (video.srcObject !== stream) video.srcObject = stream;
+        video.muted = true;
+        video.play();
+        if (AUDIO_MODE === 'video' && currentStream) playSound();
+      } else {
+        currentStream = stream;
+        playSound();
+      }
+    };
+    pc.onconnectionstatechange = function () {
+      if (pc.connectionState === 'connected') {
+        if (!soundBlocked) log('');
+        startStats();
+      } else {
+        log('Connection: ' + pc.connectionState);
+      }
+    };
+
+    pc.setRemoteDescription({ type: 'offer', sdp: sdp })
+      .then(function () { return pc.createAnswer(); })
+      .then(function (answer) { return pc.setLocalDescription(answer); })
+      .then(function () { return waitForIce(pc); })
+      .then(function () { signal({ type: 'answer', sdp: pc.localDescription.sdp }); })
+      .catch(function (err) { log('Error: ' + err); });
+  }
+
+  // Send playback stats back to the Mac page so problems can be read there.
+  function startStats() {
+    clearInterval(statsTimer);
+    statsTimer = setInterval(function () {
+      if (!pc) return;
+      pc.getStats().then(function (report) {
+        var v = null, a = null, codecs = {};
+        report.forEach(function (r) {
+          if (r.type === 'inbound-rtp' && r.kind === 'video') v = r;
+          if (r.type === 'inbound-rtp' && r.kind === 'audio') a = r;
+          if (r.type === 'codec') codecs[r.id] = r.mimeType;
+        });
+        signal({
+          type: 'tvstats',
+          ua: navigator.userAgent,
+          video: v && {
+            codec: codecs[v.codecId],
+            width: v.frameWidth, height: v.frameHeight,
+            fps: v.framesPerSecond,
+            received: v.framesReceived,
+            decoded: v.framesDecoded,
+            keyframes: v.keyFramesDecoded,
+            decoder: v.decoderImplementation,
+            dropped: v.framesDropped,
+            freezes: v.freezeCount,
+            bufferMs: v.jitterBufferEmittedCount
+              ? Math.round((v.jitterBufferDelay / v.jitterBufferEmittedCount) * 1000) : null
+          },
+          audio: a && {
+            codec: codecs[a.codecId],
+            bytes: a.bytesReceived,
+            level: a.audioLevel,
+            concealedPct: a.totalSamplesReceived
+              ? Math.round((a.concealedSamples / a.totalSamplesReceived) * 100) : null
+          },
+          element: audioState(),
+          audioMode: AUDIO_MODE,
+          videoEl: { paused: video.paused, readyState: video.readyState, w: video.videoWidth, h: video.videoHeight }
+        });
+      });
+    }, 2000);
+  }
+
+  var events = new EventSource('/events?role=tv');
+  events.onopen = function () { signal({ type: 'ready' }); };
+  events.onmessage = function (e) {
+    var msg = JSON.parse(e.data);
+    if (msg.type === 'offer') { log('Connecting…'); handleOffer(msg.sdp); }
+    else if (msg.type === 'sender-online') signal({ type: 'ready' });
+    else if (msg.type === 'bye') {
+      clearInterval(statsTimer);
+      if (pc) pc.close();
+      pc = null;
+      video.srcObject = null;
+      resetAudio();
+      log('Sender stopped. Waiting…');
+    }
+  };
+
+  // Remote "OK" (Enter) or click = user gesture that unlocks sound.
+  document.addEventListener('keydown', function (e) { if (e.keyCode === 13) playSound(); });
+  document.addEventListener('click', playSound);
+</script>
+</body>
+</html>

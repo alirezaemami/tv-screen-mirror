@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Mirror — Sender</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; }
+    button, select { font-size: 17px; padding: 9px 14px; margin: 0 8px 8px 0; }
+    video { width: 100%; margin-top: 16px; background: #000; border-radius: 6px; }
+    #status { margin-top: 12px; color: #555; }
+    #warn { margin-top: 12px; color: #b45309; }
+    .stats { margin-top: 8px; font: 13px/1.5 ui-monospace, monospace; color: #333; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Screen Mirror — Sender</h1>
+  <p>
+    1. Open the TV page on your Samsung TV.<br>
+    2. Pick quality + content type, click <b>Start mirroring</b>.<br>
+    3. <b>For sound:</b> pick a <b>Chrome Tab</b> and turn on <b>"Also share tab audio"</b>.
+  </p>
+  <select id="quality">
+    <option value="480">480p</option>
+    <option value="720">720p</option>
+    <option value="1080" selected>1080p</option>
+  </select>
+  <select id="mode">
+    <option value="motion" selected>Movie / video (smooth)</option>
+    <option value="detail">Text / slides (sharp)</option>
+  </select>
+  <select id="codec" title="Video codec (changing it reconnects)">
+    <option value="video/VP8" selected>VP8 (safe)</option>
+    <option value="video/H264">H.264 (hardware)</option>
+    <option value="video/VP9">VP9</option>
+  </select>
+  <button id="start">Start mirroring</button>
+  <button id="stop" disabled>Stop</button>
+  <div id="status">TV: waiting…</div>
+  <div id="warn"></div>
+  <div id="stats" class="stats"></div>
+  <div id="tvstats" class="stats"></div>
+  <video id="preview" autoplay muted playsinline></video>
+
+<script>
+  const QUALITY = {
+    480:  { width: 854,  height: 480,  kbps: 2000 },
+    720:  { width: 1280, height: 720,  kbps: 4000 },
+    1080: { width: 1920, height: 1080, kbps: 8000 },
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $('status'), warnEl = $('warn'), statsEl = $('stats'), tvStatsEl = $('tvstats');
+  const startBtn = $('start'), stopBtn = $('stop'), qualityEl = $('quality'), modeEl = $('mode'), preview = $('preview');
+
+  let stream = null;
+  let pc = null;
+  let statsTimer = null;
+
+  const log = (msg) => { statusEl.textContent = msg; console.log(msg); };
+  const preset = () => QUALITY[qualityEl.value];
+  const signal = (msg) =>
+    fetch('/signal?to=tv', { method: 'POST', body: JSON.stringify(msg) });
+
+  function waitForIce(pc) {
+    if (pc.iceGatheringState === 'complete') return Promise.resolve();
+    return new Promise((resolve) => {
+      const done = () => { pc.removeEventListener('icegatheringstatechange', check); resolve(); };
+      const check = () => pc.iceGatheringState === 'complete' && done();
+      pc.addEventListener('icegatheringstatechange', check);
+      setTimeout(done, 2000);
+    });
+  }
+
+  // Start Chrome near the target bitrate (it otherwise ramps up slowly) and give
+  // Opus stereo at 128 kbps. The ceiling is the highest preset; the actual per-preset
+  // cap is set live by setParameters() in applySettings().
+  function tuneSdp(sdp, kbps) {
+    const lines = sdp.split('\r\n');
+    const codecs = {};
+    lines.forEach((l) => {
+      const m = l.match(/^a=rtpmap:(\d+) ([\w-]+)\//);
+      if (m) codecs[m[1]] = m[2].toUpperCase();
+    });
+    const videoHint = `x-google-start-bitrate=${Math.round(kbps * 0.7)};x-google-max-bitrate=${QUALITY[1080].kbps}`;
+    const audioHint = 'stereo=1;sprop-stereo=1;maxaveragebitrate=128000';
+    const isVideo = (c) => ['VP8', 'VP9', 'H264', 'AV1'].includes(c);
+    const hasFmtp = new Set(lines.map((l) => (l.match(/^a=fmtp:(\d+)/) || [])[1]).filter(Boolean));
+
+    const out = [];
+    lines.forEach((l) => {
+      const fmtp = l.match(/^a=fmtp:(\d+) /);
+      if (fmtp && isVideo(codecs[fmtp[1]])) l += ';' + videoHint;
+      else if (fmtp && codecs[fmtp[1]] === 'OPUS') l += ';' + audioHint;
+      out.push(l);
+      const rtp = l.match(/^a=rtpmap:(\d+) /);
+      if (rtp && isVideo(codecs[rtp[1]]) && !hasFmtp.has(rtp[1])) out.push(`a=fmtp:${rtp[1]} ${videoHint}`);
+    });
+    return out.join('\r\n');
+  }
+
+  // Put the chosen codec first; keep the others as fallback in case the TV refuses it.
+  // For H.264, prefer Constrained Baseline (42e0..) — the most widely decodable profile.
+  function preferCodec(transceiver, mime) {
+    if (!transceiver.setCodecPreferences || !RTCRtpSender.getCapabilities) return;
+    const codecs = RTCRtpSender.getCapabilities('video').codecs;
+    const chosen = codecs.filter((c) => c.mimeType === mime);
+    chosen.sort((a, b) => (b.sdpFmtpLine || '').includes('profile-level-id=42e0') -
+                          (a.sdpFmtpLine || '').includes('profile-level-id=42e0'));
+    const rest = codecs.filter((c) => c.mimeType !== mime);
+    try { transceiver.setCodecPreferences([...chosen, ...rest]); } catch (e) { console.warn(e); }
+  }
+
+  // Apply quality + content mode to the running capture and encoder (no reconnect).
+  async function applySettings() {
+    const q = preset();
+    const smooth = modeEl.value === 'motion';
+    const video = stream && stream.getVideoTracks()[0];
+    if (video) {
+      video.contentHint = modeEl.value;
+      try {
+        await video.applyConstraints({ width: { max: q.width }, height: { max: q.height }, frameRate: 30 });
+      } catch (e) { console.warn('applyConstraints failed', e); }
+    }
+    const sender = pc && pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+    if (sender) {
+      const params = sender.getParameters();
+      if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+      params.encodings[0].maxBitrate = q.kbps * 1000;
+      params.encodings[0].maxFramerate = 30;
+      params.encodings[0].scaleResolutionDownBy = 1;
+      // When bandwidth/CPU is short: smooth mode keeps the frame rate, sharp mode keeps resolution.
+      params.degradationPreference = smooth ? 'maintain-framerate' : 'maintain-resolution';
+      try { await sender.setParameters(params); } catch (e) {
+        delete params.degradationPreference; // not supported in every Chrome version
+        try { await sender.setParameters(params); } catch (e2) { console.warn('setParameters failed', e2); }
+      }
+    }
+  }
+  qualityEl.onchange = applySettings;
+  $('codec').onchange = () => { if (stream) { log('Switching codec, reconnecting…'); connectToTv(); } };
+  modeEl.onchange = applySettings;
+
+  async function connectToTv() {
+    if (!stream) return;
+    if (pc) pc.close();
+    pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    pc.onconnectionstatechange = () => log('Connection: ' + pc.connectionState);
+    stream.getTracks().forEach((t) => {
+      const tr = pc.addTransceiver(t, { direction: 'sendonly', streams: [stream] });
+      if (t.kind === 'video') preferCodec(tr, $('codec').value);
+    });
+
+    await pc.setLocalDescription(await pc.createOffer());
+    await waitForIce(pc);
+    await signal({ type: 'offer', sdp: pc.localDescription.sdp });
+    log('Offer sent to TV, waiting for answer…');
+  }
+
+  function startStats() {
+    clearInterval(statsTimer);
+    let lastBytes = 0, lastTime = 0;
+    statsTimer = setInterval(async () => {
+      if (!pc) return;
+      const report = await pc.getStats();
+      let video, audio;
+      report.forEach((r) => {
+        if (r.type === 'outbound-rtp' && r.kind === 'video') video = r;
+        if (r.type === 'outbound-rtp' && r.kind === 'audio') audio = r;
+      });
+      if (!video) return (statsEl.textContent = '');
+      const codec = video.codecId && report.get(video.codecId);
+      const kbps = lastTime ? Math.round(((video.bytesSent - lastBytes) * 8) / (video.timestamp - lastTime)) : 0;
+      lastBytes = video.bytesSent; lastTime = video.timestamp;
+      const limit = video.qualityLimitationReason && video.qualityLimitationReason !== 'none'
+        ? `  ⚠ limited by ${video.qualityLimitationReason}` : '';
+      statsEl.textContent =
+        `MAC → ${codec ? codec.mimeType.replace('video/', '') : '?'} ${video.frameWidth || '?'}×${video.frameHeight || '?'} ` +
+        `@ ${Math.round(video.framesPerSecond || 0)}fps, ${kbps} kbps${limit}` +
+        (video.encoderImplementation ? `, encoder: ${video.encoderImplementation}` : '') +
+        `\n      audio: ${audio ? 'sending' : 'none'}`;
+    }, 1000);
+  }
+
+  function showTvStats(s) {
+    const v = s.video || {}, a = s.audio || {}, el = s.element || {};
+    const audioState = !s.audio ? 'NOT RECEIVED'
+      : !el.hasStream ? 'no stream attached'
+      : el.paused ? 'PAUSED (press OK on remote)'
+      : el.muted ? 'MUTED' : 'playing';
+    tvStatsEl.textContent =
+      `TV  ← ${v.codec ? v.codec.replace('video/', '') : '?'} ${v.width || '?'}×${v.height || '?'} @ ${Math.round(v.fps || 0)}fps, ` +
+      `dropped ${v.dropped ?? '?'}, freezes ${v.freezes ?? '?'}, buffer ${v.bufferMs ?? '?'}ms\n` +
+      `      frames received ${v.received ?? '?'}, decoded ${v.decoded ?? '?'} (keyframes ${v.keyframes ?? '?'})` +
+      (v.decoder ? `, decoder: ${v.decoder}` : '') + '\n' +
+      `      <video> element: ${s.videoEl ? `paused=${s.videoEl.paused}, readyState=${s.videoEl.readyState}, size=${s.videoEl.w}×${s.videoEl.h}` : '?'}` +
+      `   audio mode: ${s.audioMode}\n` +
+      `      audio: ${audioState}, level ${a.level != null ? a.level.toFixed(3) : '?'}, ` +
+      `bytes ${a.bytes ?? '?'}, concealed ${a.concealedPct ?? '?'}%\n` +
+      `      browser: ${s.ua}`;
+  }
+
+  startBtn.onclick = async () => {
+    const q = preset();
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { width: { max: q.width }, height: { max: q.height }, frameRate: 30 },
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          suppressLocalAudioPlayback: true, // tab sound plays on TV only
+        },
+        preferCurrentTab: false,
+        selfBrowserSurface: 'exclude',
+        surfaceSwitching: 'include',
+        systemAudio: 'include',
+      });
+    } catch (e) {
+      return log('Screen capture cancelled: ' + e.message);
+    }
+
+    const surface = stream.getVideoTracks()[0].getSettings().displaySurface;
+    if (!stream.getAudioTracks().length) {
+      warnEl.textContent = '⚠ No audio captured. Stop, then share a Chrome Tab with "Also share tab audio" on.';
+    } else if (surface !== 'browser') {
+      warnEl.textContent = '⚠ Sound may also play on the Mac. For TV-only sound, share a Chrome Tab.';
+    } else {
+      warnEl.textContent = '';
+    }
+
+    stream.getVideoTracks()[0].contentHint = modeEl.value;
+    preview.srcObject = stream;
+    stream.getVideoTracks()[0].onended = stop;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    connectToTv();
+    startStats();
+  };
+
+  function stop() {
+    clearInterval(statsTimer);
+    statsEl.textContent = tvStatsEl.textContent = warnEl.textContent = '';
+    if (pc) pc.close();
+    pc = null;
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+    preview.srcObject = null;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    signal({ type: 'bye' });
+    log('Stopped');
+  }
+  stopBtn.onclick = stop;
+
+  const events = new EventSource('/events?role=sender');
+  events.onmessage = async (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'ready') {
+      log('TV is ready' + (stream ? ', connecting…' : ' — click Start mirroring'));
+      connectToTv();
+    } else if (msg.type === 'answer' && pc) {
+      await pc.setRemoteDescription({ type: 'answer', sdp: tuneSdp(msg.sdp, preset().kbps) });
+      await applySettings();
+      log('Answer received, connecting…');
+    } else if (msg.type === 'tvstats' && pc) {
+      showTvStats(msg);
+    }
+  };
+  events.onopen = () => signal({ type: 'sender-online' });
+</script>
+</body>
+</html>

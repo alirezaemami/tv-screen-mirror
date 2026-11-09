@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Mirror — TV Stream</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    video { width: 100%; height: 100%; object-fit: contain; }
+    #status {
+      position: fixed; left: 0; right: 0; bottom: 40px; text-align: center;
+      color: #ddd; font: 32px sans-serif; text-shadow: 0 0 6px #000;
+    }
+  </style>
+</head>
+<body>
+  <video id="screen" playsinline></video>
+  <div id="status">Waiting for sender…</div>
+
+<script>
+  // Plain ES5-style JS for older TV browsers.
+  // Plays the Mac's recording through Media Source Extensions = the TV's native
+  // hardware player, which buffers and keeps audio/video in sync by itself.
+
+  var START_BUFFER = 1.5; // seconds buffered before playback starts
+  var TARGET_LAG = 2.0;   // seconds behind live we aim for
+  var KEEP_BEHIND = 15;   // seconds of played media kept in memory
+
+  // Formats to check; must match the "mse" strings in stream-sender.html.
+  var CANDIDATES = [
+    'video/mp4; codecs="avc1.640028,mp4a.40.2"',
+    'video/mp4; codecs="avc1.4d0028,mp4a.40.2"',
+    'video/mp4; codecs="avc1.42e01f,mp4a.40.2"',
+    'video/webm; codecs="vp9,opus"',
+    'video/webm; codecs="vp8,opus"'
+  ];
+
+  var video = document.getElementById('screen');
+  var statusEl = document.getElementById('status');
+  var MS = window.MediaSource || window.WebKitMediaSource;
+
+  var session = 0, mime = '', seq = 0;
+  var mediaSource = null, sb = null, queue = [];
+  var started = false, stalls = 0, statsTimer = null, keeper = null;
+  var soundBlocked = false;
+
+  function log(msg) { statusEl.textContent = msg; statusEl.style.display = msg ? '' : 'none'; console.log(msg); }
+
+  function signal(msg) {
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/signal?to=stream-sender');
+    xhr.send(JSON.stringify(msg));
+  }
+
+  function supportedFormats() {
+    if (!MS) return [];
+    return CANDIDATES.filter(function (c) { return MS.isTypeSupported(c); });
+  }
+
+  function sayReady() { signal({ type: 'ready', supported: supportedFormats() }); }
+
+  // ---- Media Source setup ----
+  function reset() {
+    session = 0; seq = 0; queue = []; sb = null; started = false;
+    clearInterval(keeper);
+    if (video.src) { video.removeAttribute('src'); video.load(); }
+    mediaSource = null;
+  }
+
+  function startSession(newSession, newMime) {
+    reset();
+    if (!MS) { log('This TV browser has no Media Source support'); signal({ type: 'error', message: 'no MediaSource' }); return; }
+    if (!MS.isTypeSupported(newMime)) {
+      log('Format not supported: ' + newMime);
+      signal({ type: 'error', message: 'unsupported ' + newMime });
+      return;
+    }
+    session = newSession; mime = newMime;
+    log('Buffering…');
+    mediaSource = new MS();
+    video.src = URL.createObjectURL(mediaSource);
+    mediaSource.addEventListener('sourceopen', function () {
+      if (session !== newSession) return;
+      sb = mediaSource.addSourceBuffer(mime);
+      sb.addEventListener('updateend', pump);
+      sb.addEventListener('error', function () { signal({ type: 'error', message: 'SourceBuffer error' }); });
+      fetchChunk(newSession);
+    });
+    keeper = setInterval(keepPace, 500);
+  }
+
+  // Long-poll chunks in order.
+  function fetchChunk(forSession) {
+    if (forSession !== session) return;
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', '/media/chunk?session=' + forSession + '&seq=' + seq);
+    xhr.responseType = 'arraybuffer';
+    xhr.onload = function () {
+      if (forSession !== session) return;
+      if (xhr.status === 200) {
+        queue.push(xhr.response);
+        seq++;
+        pump();
+        fetchChunk(forSession);
+      } else if (xhr.status === 204) {
+        fetchChunk(forSession); // nothing new yet, ask again
+      } else if (xhr.status === 410) {
+        log('Resyncing…');
+        sayReady(); // ask the sender for a fresh session
+      }
+    };
+    xhr.onerror = function () { setTimeout(function () { fetchChunk(forSession); }, 1000); };
+    xhr.send();
+  }
+
+  function pump() {
+    if (!sb || sb.updating || !queue.length) return;
+    try {
+      sb.appendBuffer(queue.shift());
+    } catch (e) {
+      if (e.name === 'QuotaExceededError') { trim(true); }
+      else { signal({ type: 'error', message: 'append: ' + e.name + ' ' + e.message }); }
+    }
+  }
+
+  function bufferedEnd() {
+    var b = video.buffered;
+    return b.length ? b.end(b.length - 1) : 0;
+  }
+
+  // Drop already-played media so the TV doesn't run out of memory.
+  function trim(urgent) {
+    if (!sb || sb.updating) return;
+    var cut = video.currentTime - (urgent ? 3 : KEEP_BEHIND);
+    var b = video.buffered;
+    if (b.length && cut > b.start(0) + 1) {
+      try { sb.remove(b.start(0), cut); } catch (e) {}
+    }
+  }
+
+  // Start once enough is buffered; afterwards keep ~TARGET_LAG seconds behind live
+  // by gently speeding up (never stutter-skipping unless very far behind).
+  function keepPace() {
+    var b = video.buffered;
+    if (!b.length) return;
+    var end = bufferedEnd();
+
+    if (!started) {
+      if (video.currentTime < b.start(0)) video.currentTime = b.start(0);
+      if (end - video.currentTime >= START_BUFFER) { started = true; play(); }
+      return;
+    }
+
+    var lag = end - video.currentTime;
+    if (lag > 10) video.currentTime = end - TARGET_LAG;   // way behind: jump
+    else if (lag > TARGET_LAG + 1.5) video.playbackRate = 1.05;
+    else if (lag < TARGET_LAG) video.playbackRate = 1.0;
+
+    if (!video.paused || soundBlocked) trim(false);
+    pump();
+  }
+
+  // ---- Full screen ----
+  // Browsers only allow full screen after a user action, so it's tied to the OK button.
+  function isFullscreen() {
+    return !!(document.fullscreenElement || document.webkitFullscreenElement);
+  }
+  function enterFullscreen() {
+    var el = document.documentElement; // whole page, so on-screen messages stay visible
+    var req = el.requestFullscreen || el.webkitRequestFullscreen;
+    if (!req || isFullscreen()) return;
+    var p = req.call(el);
+    if (p && p.catch) p.catch(function (e) { console.warn('fullscreen refused', e); });
+  }
+  function exitFullscreen() {
+    var exit = document.exitFullscreen || document.webkitExitFullscreen;
+    if (exit && isFullscreen()) exit.call(document);
+  }
+
+  // Short on-screen hint telling the user what OK will do.
+  var hintTimer = null;
+  function showHint() {
+    clearTimeout(hintTimer);
+    if (soundBlocked) return log('Press OK for sound and full screen');
+    if (!isFullscreen()) {
+      log('Press OK for full screen');
+      hintTimer = setTimeout(function () {
+        if (statusEl.textContent === 'Press OK for full screen') log('');
+      }, 5000);
+    } else {
+      log('');
+    }
+  }
+  document.addEventListener('fullscreenchange', showHint);
+  document.addEventListener('webkitfullscreenchange', showHint);
+
+  // Play with sound if allowed; otherwise muted until the user presses OK.
+  function play() {
+    video.muted = false;
+    var p = video.play();
+    if (p && p.then) {
+      p.then(function () { soundBlocked = false; showHint(); })
+       .catch(function () {
+         soundBlocked = true;
+         video.muted = true;
+         video.play();
+         showHint();
+       });
+    } else { showHint(); }
+  }
+
+  // OK button: first press turns on sound + full screen; later presses toggle full screen.
+  function onOk() {
+    if (soundBlocked && started) {
+      video.muted = false;
+      video.play();
+      soundBlocked = false;
+      enterFullscreen();
+    } else if (isFullscreen()) {
+      exitFullscreen();
+    } else {
+      enterFullscreen();
+    }
+    showHint();
+  }
+  document.addEventListener('keydown', function (e) {
+    if (e.keyCode === 13) onOk();                 // OK / Enter
+    else if (e.keyCode === 70) onOk();            // "F" on a keyboard
+  });
+  document.addEventListener('click', onOk);
+
+  // Hide the mouse/pointer cursor after 3 s of no movement.
+  var cursorTimer = null;
+  document.addEventListener('mousemove', function () {
+    document.body.style.cursor = '';
+    clearTimeout(cursorTimer);
+    cursorTimer = setTimeout(function () { document.body.style.cursor = 'none'; }, 3000);
+  });
+
+  video.addEventListener('waiting', function () { if (started) stalls++; });
+
+  // ---- Stats back to the Mac page ----
+  statsTimer = setInterval(function () {
+    if (!session) return;
+    var q = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : {};
+    signal({
+      type: 'tvstats',
+      ua: navigator.userAgent,
+      mime: mime,
+      width: video.videoWidth, height: video.videoHeight,
+      state: !started ? 'buffering' : video.paused ? 'paused' : 'playing',
+      ahead: (bufferedEnd() - video.currentTime).toFixed(1),
+      dropped: q.droppedVideoFrames != null ? q.droppedVideoFrames : '?',
+      total: q.totalVideoFrames != null ? q.totalVideoFrames : '?',
+      stalls: stalls,
+      muted: video.muted,
+      rate: video.playbackRate
+    });
+  }, 2000);
+
+  // ---- Control channel ----
+  var events = new EventSource('/events?role=stream-tv');
+  events.onopen = sayReady;
+  events.onmessage = function (e) {
+    var msg = JSON.parse(e.data);
+    if (msg.type === 'stream-start') startSession(msg.session, msg.mime);
+    else if (msg.type === 'sender-online') sayReady();
+    else if (msg.type === 'bye') { reset(); log('Sender stopped. Waiting…'); }
+  };
+</script>
+</body>
+</html>

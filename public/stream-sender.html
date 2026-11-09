@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Mirror — Stream Sender</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 40px auto; padding: 0 16px; }
+    button, select { font-size: 17px; padding: 9px 14px; margin: 0 8px 8px 0; }
+    video { width: 100%; margin-top: 16px; background: #000; border-radius: 6px; }
+    #status { margin-top: 12px; color: #555; }
+    #warn { margin-top: 12px; color: #b45309; }
+    .stats { margin-top: 8px; font: 13px/1.5 ui-monospace, monospace; color: #333; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Screen Mirror — Buffered Stream</h1>
+  <p>
+    Smooth, synced playback with ~2 s delay. Uses the TV's hardware video player.<br>
+    1. Open <b>/tvstream</b> on the TV. 2. Click <b>Start</b>, pick a <b>Chrome Tab</b>,
+    turn on <b>"Also share tab audio"</b>.
+  </p>
+  <select id="quality">
+    <option value="480">480p</option>
+    <option value="720" selected>720p</option>
+    <option value="1080">1080p</option>
+  </select>
+  <select id="format">
+    <option value="auto" selected>Format: auto</option>
+  </select>
+  <button id="start">Start</button>
+  <button id="stop" disabled>Stop</button>
+  <div id="status">TV: waiting…</div>
+  <div id="warn"></div>
+  <div id="stats" class="stats"></div>
+  <div id="tvstats" class="stats"></div>
+  <video id="preview" autoplay muted playsinline></video>
+
+<script>
+  const QUALITY = {
+    480:  { width: 854,  height: 480,  kbps: 2500 },
+    720:  { width: 1280, height: 720,  kbps: 5000 },
+    1080: { width: 1920, height: 1080, kbps: 8000 },
+  };
+
+  // rec = what Chrome's MediaRecorder produces; mse = what the TV's player is asked to play.
+  // MP4 H.264 + AAC first: hardware decoded on basically every Samsung TV.
+  const FORMATS = [
+    { label: 'MP4 H.264 High + AAC',     rec: 'video/mp4;codecs=avc1.640028,mp4a.40.2', mse: 'video/mp4; codecs="avc1.640028,mp4a.40.2"' },
+    { label: 'MP4 H.264 Main + AAC',     rec: 'video/mp4;codecs=avc1.4d0028,mp4a.40.2', mse: 'video/mp4; codecs="avc1.4d0028,mp4a.40.2"' },
+    { label: 'MP4 H.264 Baseline + AAC', rec: 'video/mp4;codecs=avc1.42e01f,mp4a.40.2', mse: 'video/mp4; codecs="avc1.42e01f,mp4a.40.2"' },
+    { label: 'WebM VP9 + Opus',          rec: 'video/webm;codecs=vp9,opus',             mse: 'video/webm; codecs="vp9,opus"' },
+    { label: 'WebM VP8 + Opus',          rec: 'video/webm;codecs=vp8,opus',             mse: 'video/webm; codecs="vp8,opus"' },
+  ];
+
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $('status'), warnEl = $('warn'), statsEl = $('stats'), tvStatsEl = $('tvstats');
+  const qualityEl = $('quality'), formatEl = $('format'), startBtn = $('start'), stopBtn = $('stop');
+
+  const log = (m) => { statusEl.textContent = m; console.log(m); };
+  const signal = (msg) => fetch('/signal?to=stream-tv', { method: 'POST', body: JSON.stringify(msg) });
+
+  let capture = null;      // what getDisplayMedia gave us
+  let recStream = null;    // capture video + (real or silent) audio
+  let recorder = null;
+  let session = 0;
+  let tvSupported = null;  // MSE formats the TV said it can play
+  let uploadChain = Promise.resolve();
+  let bytesSent = 0, lastBytes = 0, statsTimer = null;
+
+  FORMATS.forEach((f, i) => {
+    if (!MediaRecorder.isTypeSupported(f.rec)) return;
+    const o = document.createElement('option');
+    o.value = i; o.textContent = f.label;
+    formatEl.appendChild(o);
+  });
+
+  function pickFormat() {
+    if (formatEl.value !== 'auto') return FORMATS[formatEl.value];
+    return FORMATS.find((f) => MediaRecorder.isTypeSupported(f.rec) &&
+      (!tvSupported || tvSupported.includes(f.mse)));
+  }
+
+  // The TV player expects audio+video. If the tab has no audio, feed silence.
+  function withAudio(stream) {
+    if (stream.getAudioTracks().length) return stream;
+    const ctx = new AudioContext();
+    const dest = ctx.createMediaStreamDestination();
+    const gain = ctx.createGain();
+    gain.gain.value = 0;
+    const osc = ctx.createOscillator();
+    osc.connect(gain).connect(dest);
+    osc.start();
+    return new MediaStream([...stream.getVideoTracks(), ...dest.stream.getAudioTracks()]);
+  }
+
+  async function applyResolution() {
+    const q = QUALITY[qualityEl.value];
+    const track = capture && capture.getVideoTracks()[0];
+    if (track) {
+      try { await track.applyConstraints({ width: { max: q.width }, height: { max: q.height }, frameRate: 30 }); }
+      catch (e) { console.warn(e); }
+    }
+  }
+
+  // (Re)start a recording session. Called on Start, when the TV (re)connects,
+  // and when quality/format changes — each session begins with a fresh header.
+  async function startSession() {
+    if (!recStream) return;
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+    recorder = null;
+
+    const fmt = pickFormat();
+    if (!fmt) {
+      return log('No format both this Chrome and the TV support. TV supports: ' + JSON.stringify(tvSupported));
+    }
+    await applyResolution();
+    const q = QUALITY[qualityEl.value];
+
+    const r = await fetch('/media/start?mime=' + encodeURIComponent(fmt.mse), { method: 'POST' });
+    const mySession = (await r.json()).session;
+    session = mySession;
+    uploadChain = Promise.resolve();
+
+    const rec = new MediaRecorder(recStream, {
+      mimeType: fmt.rec,
+      videoBitsPerSecond: q.kbps * 1000,
+      audioBitsPerSecond: 128000,
+      videoKeyFrameIntervalDuration: 2000, // keyframe every 2 s (ignored by older Chrome)
+    });
+    rec.ondataavailable = (e) => {
+      if (!e.data.size || mySession !== session) return;
+      bytesSent += e.data.size;
+      // Serialize uploads so chunks arrive in order.
+      uploadChain = uploadChain.then(() =>
+        fetch('/media/chunk?session=' + mySession, { method: 'POST', body: e.data }).catch(() => {}));
+    };
+    rec.onerror = (e) => log('Recorder error: ' + (e.error && e.error.message));
+    rec.start(250); // emit a chunk every 250 ms
+    recorder = rec;
+    log(`Streaming ${q.width}×${q.height} as ${fmt.label} (session ${mySession})`);
+  }
+
+  startBtn.onclick = async () => {
+    const q = QUALITY[qualityEl.value];
+    try {
+      capture = await navigator.mediaDevices.getDisplayMedia({
+        video: { width: { max: q.width }, height: { max: q.height }, frameRate: 30 },
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          suppressLocalAudioPlayback: true, // tab sound plays on the TV only
+        },
+        preferCurrentTab: false,
+        selfBrowserSurface: 'exclude',
+        surfaceSwitching: 'include',
+        systemAudio: 'include',
+      });
+    } catch (e) {
+      return log('Capture cancelled: ' + e.message);
+    }
+    const surface = capture.getVideoTracks()[0].getSettings().displaySurface;
+    warnEl.textContent = !capture.getAudioTracks().length
+      ? '⚠ No audio captured. Stop, then share a Chrome Tab with "Also share tab audio" on.'
+      : surface !== 'browser' ? '⚠ Sound may also play on the Mac. For TV-only sound, share a Chrome Tab.' : '';
+
+    capture.getVideoTracks()[0].contentHint = 'motion';
+    capture.getVideoTracks()[0].onended = stop;
+    recStream = withAudio(capture);
+    $('preview').srcObject = capture;
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    startStats();
+    startSession();
+  };
+
+  function stop() {
+    session = -1;
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+    recorder = null;
+    if (capture) capture.getTracks().forEach((t) => t.stop());
+    capture = recStream = null;
+    $('preview').srcObject = null;
+    clearInterval(statsTimer);
+    statsEl.textContent = tvStatsEl.textContent = warnEl.textContent = '';
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    signal({ type: 'bye' });
+    log('Stopped');
+  }
+  stopBtn.onclick = stop;
+
+  qualityEl.onchange = startSession;
+  formatEl.onchange = startSession;
+
+  function startStats() {
+    clearInterval(statsTimer);
+    statsTimer = setInterval(() => {
+      const kbps = Math.round(((bytesSent - lastBytes) * 8) / 1000);
+      lastBytes = bytesSent;
+      const s = capture && capture.getVideoTracks()[0].getSettings();
+      statsEl.textContent = `MAC → ${s ? `${s.width}×${s.height} @ ${Math.round(s.frameRate || 0)}fps` : ''}, ${kbps} kbps` +
+        `, audio: ${capture && capture.getAudioTracks().length ? 'tab audio' : 'silent'}`;
+    }, 1000);
+  }
+
+  function showTvStats(s) {
+    tvStatsEl.textContent =
+      `TV  ← ${s.width || '?'}×${s.height || '?'}, ${s.state}, buffer ahead ${s.ahead}s, ` +
+      `dropped ${s.dropped}/${s.total} frames, stalls ${s.stalls}\n` +
+      `      sound: ${s.muted ? 'MUTED (press OK on remote)' : 'on'}, speed ${s.rate}x, mime ${s.mime}\n` +
+      `      browser: ${s.ua}`;
+  }
+
+  const events = new EventSource('/events?role=stream-sender');
+  events.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'ready') {
+      tvSupported = msg.supported || null;
+      log('TV ready. Supports: ' + (tvSupported && tvSupported.length ? tvSupported.join(' | ') : 'none reported'));
+      startSession(); // fresh session so the TV starts from a header
+    } else if (msg.type === 'tvstats') {
+      showTvStats(msg);
+    } else if (msg.type === 'error') {
+      log('TV error: ' + msg.message);
+    }
+  };
+  events.onopen = () => signal({ type: 'sender-online' });
+</script>
+</body>
+</html>
